@@ -1,63 +1,61 @@
-using CUDA, Graphs, SimpleWeightedGraphs, DataStructures
-
-# Relax neighbours of i
-function relax(g, D, InList, i)
-    @inbounds for j in neighbors(g,i)
-        # weights[j,i] gives weight of edge i->j
-        dist = D[i] + g.weights[j,i]
-        if D[j] > dist
-            atomic_min!(D, j, dist)
-            InList[j] = true
-        end
+# relax neighbours of all vertices in list
+function relax(g, D, subList, List, InList, vperthread, nverts)
+    #show(List[1:nverts])
+    @threads for i in List[1:nverts]
+       @inbounds for j in neighbors(g,i)
+          # weights[j,i] gives weight of edge i->j
+          # atomic_min returns old value
+          if atomic_min!(D[j], D[i][] + g.weights[j,i]) > D[j][]
+             # atomic to avoid duplicates, then add to thread's list
+             # atomic_cas returns old value
+             if(atomic_cas!(InList[j],0,1) === 0)
+                id = threadid()
+                listSize = length(subList[id])
+                listSize <= vperthread[id] && resize!(subList[id], 2*listSize)
+                vperthread[id] += 1
+                subList[id][vperthread[id]] = j
+             end
+          end
+       end
     end
-end
+ end
 
-function relax_kernel(g, D, InList, active_nodes)
-    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    if idx <= length(active_nodes)
-        i = active_nodes[idx]
-        relax(g, D, InList, i)
+ function copyVerts!(List, InList, sub, start, nper)
+    for i in 1:nper
+      InList[sub[i]][] = 0
+      List[start+i] = sub[i]
     end
-    return nothing
-end
+ end
 
-function ssspbfgraph(g, source)
+ function ssspbfpargraph(g, source)
     n = nv(g)
     m = ne(g)
-
-    # Sparse representation of active list
-    InList = zeros(Bool,n)
-
-    # Initialize distance array
-    D = fill(typemax(eltype(g.weights)),n)
-    D[source] = zero(eltype(g.weights))
-    InList[source] = true
-
-    # Move data to GPU
-    g_d = CuGraph(g)
-    D_d = CuArray(D)
-    InList_d = CuArray(InList)
-
-    # Calculate number of threads and blocks for CUDA kernel
-    threads = 256
-    blocks = ceil(Int, n / threads)
-
-    while any(InList_d)
-        # Find active nodes
-        active_nodes = findall(x -> x == true, InList_d)
-
-        # Reset InList for next iteration
-        fill!(InList_d, false)
-
-        # Call CUDA kernel
-        @cuda threads=threads blocks=blocks relax_kernel(g_d, D_d, InList_d, active_nodes)
-
-        # Synchronize to ensure all threads have completed
-        CUDA.synchronize()
+ 
+    # Vertex list
+    List = Array{Int64,1}(undef,n)
+    nt = nthreads()
+    # Per thread vertex list buffers; will grow if too small
+    subList = [similar(List, 10) for i = 1:nt]
+    vperthread = zeros(Int64,nt) # Per thread vertex count
+ 
+    T = eltype(g.weights)
+    D = [Atomic{T}(typemax(T)) for k = 1:n]
+    InList = [Atomic{Int}(0) for k = 1:n]
+ 
+    D[source][] = zero(T)
+    List[1] = source
+    nverts = 1 # no. of vertices in list
+ 
+    while nverts > 0
+       relax(g, D, subList, List, InList, vperthread, nverts)
+       # write thread private vertices to shared List
+       start = cumsum(vperthread)
+       nverts = start[nt]
+       start -= vperthread # exclusive prefix sum
+       @threads for i = 1:nt
+          copyVerts!(List, InList, subList[i], start[i], vperthread[i])
+       end
+       vperthread .= 0
     end
-
-    # Copy the result back to CPU
-    D = Array(D_d)
-
     return D
-end
+ end
