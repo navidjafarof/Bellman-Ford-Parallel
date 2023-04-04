@@ -1,3 +1,5 @@
+using Base.Threads
+
 # relax neighbours of all vertices in list
 function relax(g, D, subList, List, InList, vperthread, nverts)
     #show(List[1:nverts])
